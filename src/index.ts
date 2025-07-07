@@ -7,6 +7,10 @@
  * (e.g., first block shuffles songs played once, second block shuffles songs
  * played once AND twice, etc.).
  *
+ * The /shuffle endpoint now returns immediately, and the playlist creation
+ * happens asynchronously. A new /status/:processId endpoint allows checking
+ * the progress and results.
+ *
  * Environment Variables Required:
  * - SPOTIFY_CLIENT_ID: Your Spotify Application Client ID
  * - SPOTIFY_CLIENT_SECRET: Your Spotify Application Client Secret
@@ -15,11 +19,11 @@
  * - LASTFM_USERNAME: Your Last.fm Username (for fetching your specific play counts)
  *
  * KV Namespace Required:
- * - SPOTIFY_TOKENS: A KV namespace to store user-specific Spotify access and refresh tokens.
+ * - SPOTIFY_TOKENS: A KV namespace to store user-specific Spotify access and refresh tokens,
+ * and also the status of playlist generation processes.
  */
 
 // Declare global types for Cloudflare Worker environment variables and KV namespace
-// This is necessary for TypeScript to recognize these global variables.
 declare const SPOTIFY_CLIENT_ID: string;
 declare const SPOTIFY_CLIENT_SECRET: string;
 declare const SPOTIFY_REDIRECT_URI: string;
@@ -35,6 +39,9 @@ const SPOTIFY_API_BASE_URL: string = 'https://api.spotify.com/v1';
 // Define constants for Last.fm API endpoints
 const LASTFM_API_BASE_URL: string = 'http://ws.audioscrobbler.com/2.0/';
 
+// KV key prefix for storing playlist generation status
+const STATUS_KEY_PREFIX: string = 'playlist_status_';
+
 // --- Type Definitions ---
 
 interface SpotifyTrack {
@@ -42,8 +49,6 @@ interface SpotifyTrack {
     name: string;
     artists: Array<{ name: string }>;
     uri: string;
-    // Add other properties you might use from Spotify API if needed
-    // e.g., album: { release_date: string }, popularity: number
     [key: string]: any; // Allow for other properties not explicitly defined
 }
 
@@ -55,6 +60,14 @@ interface SpotifyTokenData {
     access_token: string;
     refresh_token: string;
     expires_at: number; // Unix timestamp in milliseconds
+}
+
+interface PlaylistStatus {
+    status: 'pending' | 'fetching_liked_songs' | 'fetching_lastfm_counts' | 'applying_shuffle_logic' | 'creating_playlist' | 'adding_tracks' | 'completed' | 'failed';
+    message: string;
+    playlistUrl?: string;
+    error?: string;
+    timestamp: number;
 }
 
 // --- Helper Functions ---
@@ -98,7 +111,7 @@ async function spotifyApiFetch(url: string, accessToken: string, options: Reques
         headers: {
             'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
-            ...(options.headers as Record<string, string>), // Cast to Record<string, string> for spread
+            ...(options.headers as Record<string, string>),
         },
         ...options,
     });
@@ -146,7 +159,7 @@ async function refreshSpotifyToken(userId: string, refreshToken: string): Promis
 
     const data: any = await response.json();
     const newAccessToken: string = data.access_token;
-    const newRefreshToken: string = data.refresh_token || refreshToken; // Refresh token might not always be new
+    const newRefreshToken: string = data.refresh_token || refreshToken;
 
     // Store updated tokens in KV
     await SPOTIFY_TOKENS.put(userId, JSON.stringify({
@@ -252,9 +265,9 @@ async function fetchLastFmPlayCount(artistName: string, trackName: string, lastF
  * - Third, a shuffled list of all songs with 0, 1, 2, or 3 plays is added.
  *
  * @param {TrackWithPlayCount[]} tracks - An array of track objects, now with 'lastFmPlayCount' property.
- * @returns {TrackWithPlayCount[]} The shuffled and cumulatively ordered array of track objects.
+ * @returns {Promise<TrackWithPlayCount[]>} The shuffled and cumulatively ordered array of track objects.
  */
-function applyShuffleLogic(tracks: TrackWithPlayCount[]): TrackWithPlayCount[] {
+async function applyShuffleLogic(tracks: TrackWithPlayCount[]): Promise<TrackWithPlayCount[]> {
     if (tracks.length === 0) {
         return [];
     }
@@ -295,7 +308,6 @@ function applyShuffleLogic(tracks: TrackWithPlayCount[]): TrackWithPlayCount[] {
             finalPlaylist.push(...shuffledCurrentPool);
         }
     }
-
     return finalPlaylist;
 }
 
@@ -339,22 +351,109 @@ async function addTracksToPlaylist(accessToken: string, playlistId: string, trac
     }
 }
 
+/**
+ * Initiates the asynchronous playlist generation process.
+ * This function is called via event.waitUntil() and updates KV with status.
+ * @param {string} userId - The user ID.
+ * @param {string} accessToken - The Spotify access token.
+ * @param {string} spotifyUserId - The Spotify user ID.
+ * @param {string} processId - The unique ID for this process.
+ */
+async function startPlaylistGeneration(userId: string, accessToken: string, spotifyUserId: string, processId: string): Promise<void> {
+    const statusKey = STATUS_KEY_PREFIX + processId;
+
+    try {
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'fetching_liked_songs',
+            message: 'Fetching liked songs from Spotify...',
+            timestamp: Date.now()
+        } as PlaylistStatus));
+
+        const likedTracks: SpotifyTrack[] = await fetchAllLikedSongs(accessToken);
+        if (likedTracks.length === 0) {
+            await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+                status: 'completed',
+                message: 'No liked songs found in your Spotify library.',
+                timestamp: Date.now()
+            } as PlaylistStatus));
+            return;
+        }
+
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'fetching_lastfm_counts',
+            message: `Fetching Last.fm play counts for ${likedTracks.length} tracks...`,
+            timestamp: Date.now()
+        } as PlaylistStatus));
+
+        const tracksWithPlayCounts: TrackWithPlayCount[] = [];
+        for (const track of likedTracks) {
+            const artistName: string = track.artists.map((a: { name: string }) => a.name).join(', ');
+            const trackName: string = track.name;
+            const playCount: number | null = await fetchLastFmPlayCount(artistName, trackName, LASTFM_API_KEY, LASTFM_USERNAME);
+            tracksWithPlayCounts.push({ ...track, lastFmPlayCount: playCount });
+        }
+
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'applying_shuffle_logic',
+            message: 'Applying cumulative shuffle logic...',
+            timestamp: Date.now()
+        } as PlaylistStatus));
+
+        const shuffledTracks: TrackWithPlayCount[] = await applyShuffleLogic(tracksWithPlayCounts);
+
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'creating_playlist',
+            message: 'Creating new Spotify playlist...',
+            timestamp: Date.now()
+        } as PlaylistStatus));
+
+        const playlistName: string = `Shuffled Liked Songs (Cumulative Plays) - ${new Date().toLocaleString()}`;
+        const newPlaylist: any = await createPlaylist(accessToken, spotifyUserId, playlistName);
+        const playlistId: string = newPlaylist.id;
+        const playlistUrl: string = newPlaylist.external_urls.spotify;
+
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'adding_tracks',
+            message: `Adding ${shuffledTracks.length} tracks to playlist...`,
+            timestamp: Date.now()
+        } as PlaylistStatus));
+
+        const trackUris: string[] = shuffledTracks.map((track: TrackWithPlayCount) => track.uri);
+        await addTracksToPlaylist(accessToken, playlistId, trackUris);
+
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'completed',
+            message: `Successfully created and populated playlist: ${playlistName}`,
+            playlistUrl: playlistUrl,
+            timestamp: Date.now()
+        } as PlaylistStatus));
+
+    } catch (error: any) {
+        console.error(`Playlist generation failed for process ${processId}:`, error);
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'failed',
+            message: 'Playlist generation failed.',
+            error: error.message || 'Unknown error',
+            timestamp: Date.now()
+        } as PlaylistStatus));
+    }
+}
+
 // --- Main Worker Event Listener ---
 
 addEventListener('fetch', (event: FetchEvent) => {
-    event.respondWith(handleRequest(event.request));
+    event.respondWith(handleRequest(event.request, event));
 });
 
-async function handleRequest(request: Request): Promise<Response> {
+async function handleRequest(request: Request, event: FetchEvent): Promise<Response> {
     const url: URL = new URL(request.url);
     const path: string = url.pathname;
     const userId: string = 'default_user'; // A simple fixed user ID for single-user setup. For multi-user, derive from auth.
 
     try {
         if (path === '/login') {
-            // Step 1: Redirect to Spotify authorization page
             const state: string = generateRandomString(16);
-            const scope: string = 'user-library-read playlist-modify-private playlist-modify-public user-read-private'; // Request necessary scopes
+            const scope: string = 'user-library-read playlist-modify-private playlist-modify-public user-read-private';
 
             const queryParams: string = encodeQueryParams({
                 response_type: 'code',
@@ -367,7 +466,6 @@ async function handleRequest(request: Request): Promise<Response> {
             return Response.redirect(`${SPOTIFY_AUTH_URL}?${queryParams}`, 302);
 
         } else if (path === '/callback') {
-            // Step 2: Handle Spotify callback and exchange code for tokens
             const code: string | null = url.searchParams.get('code');
             const state: string | null = url.searchParams.get('state');
             const error: string | null = url.searchParams.get('error');
@@ -378,8 +476,6 @@ async function handleRequest(request: Request): Promise<Response> {
             if (!code) {
                 return new Response('Missing authorization code in callback.', { status: 400 });
             }
-            // In a real app, you'd verify the 'state' parameter to prevent CSRF.
-            // For this example, we'll skip state verification for simplicity.
 
             const client_id: string = SPOTIFY_CLIENT_ID;
             const client_secret: string = SPOTIFY_CLIENT_SECRET;
@@ -409,9 +505,8 @@ async function handleRequest(request: Request): Promise<Response> {
             const tokenData: any = await tokenResponse.json();
             const accessToken: string = tokenData.access_token;
             const refreshToken: string = tokenData.refresh_token;
-            const expiresIn: number = tokenData.expires_in; // seconds
+            const expiresIn: number = tokenData.expires_in;
 
-            // Store tokens in KV for future use
             await SPOTIFY_TOKENS.put(userId, JSON.stringify({
                 access_token: accessToken,
                 refresh_token: refreshToken,
@@ -421,7 +516,6 @@ async function handleRequest(request: Request): Promise<Response> {
             return new Response('Successfully logged in to Spotify! You can now go to /shuffle to create a playlist.', { status: 200 });
 
         } else if (path === '/shuffle') {
-            // Step 3: Fetch liked songs, shuffle, and create playlist
             let accessToken: string;
             try {
                 accessToken = await getValidAccessToken(userId);
@@ -430,54 +524,49 @@ async function handleRequest(request: Request): Promise<Response> {
                 return new Response(`Authentication required. Please visit /login first. Error: ${e.message}`, { status: 401 });
             }
 
-            // Get current user's profile to get their ID
             const userProfile: any = await spotifyApiFetch(`${SPOTIFY_API_BASE_URL}/me`, accessToken);
             const spotifyUserId: string = userProfile.id;
 
-            // Fetch all liked songs from Spotify
-            const likedTracks: SpotifyTrack[] = await fetchAllLikedSongs(accessToken);
-            if (likedTracks.length === 0) {
-                return new Response('No liked songs found in your Spotify library.', { status: 200 });
+            const processId: string = generateRandomString(20); // Unique ID for this process
+            const statusKey = STATUS_KEY_PREFIX + processId;
+
+            // Store initial pending status
+            await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+                status: 'pending',
+                message: 'Playlist generation process initiated.',
+                timestamp: Date.now()
+            } as PlaylistStatus));
+
+            // Start the playlist generation in the background
+            event.waitUntil(startPlaylistGeneration(userId, accessToken, spotifyUserId, processId));
+
+            return new Response(`Playlist generation started! Check status at /status/${processId}`, { status: 202 }); // 202 Accepted
+
+        } else if (path.startsWith('/status/')) {
+            const processId: string = path.substring('/status/'.length);
+            const statusKey = STATUS_KEY_PREFIX + processId;
+
+            const statusDataStr: string | null = await SPOTIFY_TOKENS.get(statusKey);
+
+            if (!statusDataStr) {
+                return new Response('Process ID not found or expired.', { status: 404 });
             }
 
-            // Fetch Last.fm play counts for each track
-            console.log(`Fetching Last.fm play counts for ${likedTracks.length} tracks...`);
-            const tracksWithPlayCounts: TrackWithPlayCount[] = [];
-            for (const track of likedTracks) {
-                const artistName: string = track.artists.map((a: { name: string }) => a.name).join(', ');
-                const trackName: string = track.name;
-                const playCount: number | null = await fetchLastFmPlayCount(artistName, trackName, LASTFM_API_KEY, LASTFM_USERNAME);
-                tracksWithPlayCounts.push({ ...track, lastFmPlayCount: playCount });
-            }
-            console.log('Finished fetching Last.fm play counts.');
-
-            // Apply custom shuffle logic based on Last.fm play counts (cumulative)
-            const shuffledTracks: TrackWithPlayCount[] = applyShuffleLogic(tracksWithPlayCounts);
-
-            // Create a new playlist
-            const playlistName: string = `Shuffled Liked Songs (Cumulative Plays) - ${new Date().toLocaleString()}`;
-            const newPlaylist: any = await createPlaylist(accessToken, spotifyUserId, playlistName);
-            const playlistId: string = newPlaylist.id;
-            const playlistUrl: string = newPlaylist.external_urls.spotify;
-
-            // Add shuffled tracks to the new playlist
-            const trackUris: string[] = shuffledTracks.map((track: TrackWithPlayCount) => track.uri);
-            await addTracksToPlaylist(accessToken, playlistId, trackUris);
-
-            return new Response(`Successfully created and populated playlist: <a href="${playlistUrl}" target="_blank">${playlistName}</a> with ${shuffledTracks.length} songs.`, {
-                headers: { 'Content-Type': 'text/html' },
+            const status: PlaylistStatus = JSON.parse(statusDataStr);
+            return new Response(JSON.stringify(status), {
+                headers: { 'Content-Type': 'application/json' },
                 status: 200
             });
 
         } else {
-            // Default route
             return new Response(`
                 <h1>Spotify Liked Songs Shuffler Worker</h1>
                 <p>Welcome! This worker helps you shuffle your Spotify liked songs into a new playlist, prioritizing least played songs using Last.fm data.</p>
                 <p><strong>Important:</strong> You need to configure Spotify and Last.fm API keys and your Last.fm username as environment variables in your Cloudflare Worker settings.</p>
                 <ul>
                     <li><a href="/login">Login with Spotify</a>: Authorize this worker to access your Spotify account.</li>
-                    <li><a href="/shuffle">Shuffle Liked Songs</a>: After logging in, visit this URL to fetch your liked songs, retrieve Last.fm play counts, apply cumulative shuffle logic, and create a new Spotify playlist.</li>
+                    <li><a href="/shuffle">Shuffle Liked Songs (Async)</a>: Visit this URL to initiate the playlist generation. You'll get a process ID to check its status.</li>
+                    <li><strong>Check Status:</strong> After starting a shuffle, append the process ID to <code>/status/</code> (e.g., <code>/status/YOUR_PROCESS_ID</code>) to get updates.</li>
                 </ul>
                 <p>Make sure you have set up the required environment variables (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, <strong>LASTFM_API_KEY, LASTFM_USERNAME</strong>) and a KV namespace (SPOTIFY_TOKENS) in your Cloudflare Worker settings.</p>
             `, { headers: { 'Content-Type': 'text/html' } });
