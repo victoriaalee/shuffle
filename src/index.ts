@@ -2,9 +2,10 @@
  * Cloudflare Worker for Spotify Liked Songs Shuffle with Last.fm Play Counts (TypeScript)
  *
  * This worker authenticates with Spotify, fetches a user's liked songs,
- * retrieves their play counts from Last.fm in a batched and rate-limited manner,
+ * then fetches the user's top tracks from Last.fm to get play counts.
+ * It matches Spotify songs to Last.fm top tracks, assigns play counts,
  * and creates a new Spotify playlist where songs are cumulatively shuffled
- * based on their play count.
+ * based on their play count (least played first).
  *
  * The /shuffle endpoint returns immediately, and the playlist creation
  * happens asynchronously. A new /status/:processId endpoint allows checking
@@ -41,9 +42,9 @@ const LASTFM_API_BASE_URL: string = 'http://ws.audioscrobbler.com/2.0/';
 // KV key prefix for storing playlist generation status
 const STATUS_KEY_PREFIX: string = 'playlist_status_';
 
-// Configuration for Last.fm API batching
-const LASTFM_BATCH_SIZE: number = 10; // Number of Last.fm requests to make concurrently in a batch
-const LASTFM_BATCH_DELAY_MS: number = 500; // Delay between batches in milliseconds to avoid rate limits
+// Configuration for Last.fm API fetching (for top tracks, not individual lookups)
+const LASTFM_TOP_TRACKS_LIMIT: number = 1000; // Max limit per page for user.getTopTracks
+const LASTFM_PAGE_DELAY_MS: number = 200; // Delay between fetching Last.fm top track pages
 
 // --- Type Definitions ---
 
@@ -66,7 +67,7 @@ interface SpotifyTokenData {
 }
 
 interface PlaylistStatus {
-    status: 'pending' | 'fetching_liked_songs' | 'fetching_lastfm_counts' | 'applying_shuffle_logic' | 'creating_playlist' | 'adding_tracks' | 'completed' | 'failed';
+    status: 'pending' | 'fetching_liked_songs' | 'fetching_lastfm_top_tracks' | 'matching_tracks' | 'applying_shuffle_logic' | 'creating_playlist' | 'adding_tracks' | 'completed' | 'failed';
     message: string;
     playlistUrl?: string;
     error?: string;
@@ -219,61 +220,61 @@ async function fetchAllLikedSongs(accessToken: string): Promise<SpotifyTrack[]> 
 }
 
 /**
- * Fetches the play count for a specific track from Last.fm.
- * @param {string} artistName - The artist's name.
- * @param {string} trackName - The track's name.
+ * Fetches a user's top tracks from Last.fm, handling pagination.
  * @param {string} lastFmApiKey - Your Last.fm API key.
  * @param {string} lastFmUsername - Your Last.fm username.
- * @returns {Promise<number|null>} The play count, or null if not found/error.
+ * @returns {Promise<Array<{ artist: string, name: string, playcount: number }>>} An array of top track objects.
  */
-async function fetchLastFmPlayCount(artistName: string, trackName: string, lastFmApiKey: string, lastFmUsername: string): Promise<number | null> {
-    const params: Record<string, string> = {
-        method: 'track.getInfo',
-        api_key: lastFmApiKey,
-        artist: artistName,
-        track: trackName,
-        username: lastFmUsername, // Crucial for getting user-specific play count
-        format: 'json'
-    };
-    const url: string = `${LASTFM_API_BASE_URL}?${encodeQueryParams(params)}`;
+async function fetchLastFmTopTracks(lastFmApiKey: string, lastFmUsername: string): Promise<Array<{ artist: string, name: string, playcount: number }>> {
+    let allTopTracks: Array<{ artist: string, name: string, playcount: number }> = [];
+    let page = 1;
+    let totalPages = 1; // Initialize to 1 to enter the loop
 
-    try {
-        const response: Response = await fetch(url);
-        if (!response.ok) {
-            console.warn(`Last.fm API Error (${response.status}) for ${artistName} - ${trackName}`);
-            return null;
+    while (page <= totalPages) {
+        const params: Record<string, string | number> = {
+            method: 'user.getTopTracks',
+            user: lastFmUsername,
+            api_key: lastFmApiKey,
+            limit: LASTFM_TOP_TRACKS_LIMIT,
+            page: page,
+            format: 'json'
+        };
+        const url: string = `${LASTFM_API_BASE_URL}?${encodeQueryParams(params)}`;
+
+        try {
+            const response: Response = await fetch(url);
+            if (!response.ok) {
+                console.error(`Last.fm API Error (${response.status}) fetching top tracks for page ${page}`);
+                // If an error occurs, we might still have partial data, so break and return what we have.
+                break;
+            }
+            const data: any = await response.json();
+
+            if (data && data.toptracks && data.toptracks.track) {
+                allTopTracks = allTopTracks.concat(
+                    data.toptracks.track.map((t: any) => ({
+                        artist: t.artist.name,
+                        name: t.name,
+                        playcount: parseInt(t.playcount, 10)
+                    }))
+                );
+                totalPages = parseInt(data.toptracks['@attr'].totalPages, 10);
+                page++;
+
+                // Add delay between pages to respect Last.fm rate limits
+                if (page <= totalPages) {
+                    await new Promise(resolve => setTimeout(resolve, LASTFM_PAGE_DELAY_MS));
+                }
+            } else {
+                console.warn('Last.fm top tracks response missing expected data structure.');
+                break;
+            }
+        } catch (error: any) {
+            console.error(`Error fetching Last.fm top tracks for page ${page}:`, error);
+            break; // Break loop on error
         }
-        const data: any = await response.json();
-        if (data && data.track && typeof data.track.userplaycount !== 'undefined') {
-            return parseInt(data.track.userplaycount, 10);
-        }
-        console.log(`No Last.fm play count found for: ${artistName} - ${trackName}`);
-        return null;
-    } catch (error: any) {
-        console.error(`Error fetching Last.fm play count for ${artistName} - ${trackName}:`, error);
-        return null;
     }
-}
-
-/**
- * Fetches Last.fm play counts for a batch of tracks concurrently.
- * @param {SpotifyTrack[]} tracksBatch - The batch of Spotify tracks.
- * @param {string} lastFmApiKey - Your Last.fm API key.
- * @param {string} lastFmUsername - Your Last.fm username.
- * @returns {Promise<TrackWithPlayCount[]>} Tracks with their fetched play counts.
- */
-async function fetchLastFmPlayCountsBatch(
-    tracksBatch: SpotifyTrack[],
-    lastFmApiKey: string,
-    lastFmUsername: string
-): Promise<TrackWithPlayCount[]> {
-    const promises = tracksBatch.map(async (track) => {
-        const artistName = track.artists.map(a => a.name).join(', ');
-        const trackName = track.name;
-        const playCount = await fetchLastFmPlayCount(artistName, trackName, lastFmApiKey, lastFmUsername);
-        return { ...track, lastFmPlayCount: playCount };
-    });
-    return Promise.all(promises);
+    return allTopTracks;
 }
 
 
@@ -405,31 +406,36 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
         }
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
-            status: 'fetching_lastfm_counts',
-            message: `Fetching Last.fm play counts for ${likedTracks.length} tracks (this may take a while)...`,
+            status: 'fetching_lastfm_top_tracks',
+            message: 'Fetching Last.fm top tracks...',
             timestamp: Date.now(),
             progress: '10%'
         } as PlaylistStatus));
 
-        const tracksWithPlayCounts: TrackWithPlayCount[] = [];
-        for (let i = 0; i < likedTracks.length; i += LASTFM_BATCH_SIZE) {
-            const batch = likedTracks.slice(i, i + LASTFM_BATCH_SIZE);
-            const processedBatch = await fetchLastFmPlayCountsBatch(batch, LASTFM_API_KEY, LASTFM_USERNAME);
-            tracksWithPlayCounts.push(...processedBatch);
+        const lastFmTopTracks = await fetchLastFmTopTracks(LASTFM_API_KEY, LASTFM_USERNAME);
+        const lastFmPlayCountMap = new Map<string, number>(); // Key: "ArtistName - TrackName" (normalized)
 
-            const progressPercentage = Math.min(90, Math.floor(((i + batch.length) / likedTracks.length) * 80) + 10); // 10% to 90% for Last.fm fetch
-            await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
-                status: 'fetching_lastfm_counts',
-                message: `Fetching Last.fm play counts: ${tracksWithPlayCounts.length}/${likedTracks.length} tracks processed.`,
-                timestamp: Date.now(),
-                progress: `${progressPercentage}%`
-            } as PlaylistStatus));
-
-            // Add delay between batches to respect Last.fm rate limits
-            if (i + LASTFM_BATCH_SIZE < likedTracks.length) {
-                await new Promise(resolve => setTimeout(resolve, LASTFM_BATCH_DELAY_MS));
-            }
+        for (const track of lastFmTopTracks) {
+            const normalizedArtist = track.artist.toLowerCase().trim();
+            const normalizedTrack = track.name.toLowerCase().trim();
+            lastFmPlayCountMap.set(`${normalizedArtist} - ${normalizedTrack}`, track.playcount);
         }
+
+        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+            status: 'matching_tracks',
+            message: `Matching ${likedTracks.length} Spotify songs with Last.fm data...`,
+            timestamp: Date.now(),
+            progress: '50%'
+        } as PlaylistStatus));
+
+        const tracksWithPlayCounts: TrackWithPlayCount[] = [];
+        for (const track of likedTracks) {
+            const normalizedArtist = track.artists.map(a => a.name).join(', ').toLowerCase().trim();
+            const normalizedTrack = track.name.toLowerCase().trim();
+            const playCount = lastFmPlayCountMap.get(`${normalizedArtist} - ${normalizedTrack}`);
+            tracksWithPlayCounts.push({ ...track, lastFmPlayCount: playCount !== undefined ? playCount : 0 }); // Default to 0 plays if not found
+        }
+        console.log('Finished matching Last.fm play counts.');
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'applying_shuffle_logic',
