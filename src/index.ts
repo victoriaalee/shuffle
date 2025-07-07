@@ -53,8 +53,8 @@ const STATUS_KEY_PREFIX: string = 'playlist_status_';
 // These limits are designed to keep the total subrequests under 50.
 // Fetching liked songs and Last.fm top tracks will now attempt to get all data.
 // The primary limit is now on adding tracks to the playlist.
-const SPOTIFY_PLAYLIST_ADD_MAX_REQUESTS: number = 40;     // Max 40 Spotify API calls for adding tracks (40 * 100 = 4000 tracks)
-                                                         // This leaves ~10 requests for initial auth, fetching liked songs,
+const SPOTIFY_PLAYLIST_ADD_MAX_REQUESTS: number = 15;     // Max 15 Spotify API calls for adding tracks (15 * 100 = 1500 tracks)
+                                                         // This leaves ~35 requests for initial auth, fetching liked songs,
                                                          // and fetching Last.fm top tracks.
 
 // Configuration for Last.fm API fetching (for top tracks, not individual lookups)
