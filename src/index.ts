@@ -2,12 +2,11 @@
  * Cloudflare Worker for Spotify Liked Songs Shuffle with Last.fm Play Counts (TypeScript)
  *
  * This worker authenticates with Spotify, fetches a user's liked songs,
- * retrieves their play counts from Last.fm, and creates a new Spotify playlist
- * where songs are cumulatively shuffled based on their play count.
- * (e.g., first block shuffles songs played once, second block shuffles songs
- * played once AND twice, etc.).
+ * retrieves their play counts from Last.fm in a batched and rate-limited manner,
+ * and creates a new Spotify playlist where songs are cumulatively shuffled
+ * based on their play count.
  *
- * The /shuffle endpoint now returns immediately, and the playlist creation
+ * The /shuffle endpoint returns immediately, and the playlist creation
  * happens asynchronously. A new /status/:processId endpoint allows checking
  * the progress and results.
  *
@@ -42,6 +41,10 @@ const LASTFM_API_BASE_URL: string = 'http://ws.audioscrobbler.com/2.0/';
 // KV key prefix for storing playlist generation status
 const STATUS_KEY_PREFIX: string = 'playlist_status_';
 
+// Configuration for Last.fm API batching
+const LASTFM_BATCH_SIZE: number = 10; // Number of Last.fm requests to make concurrently in a batch
+const LASTFM_BATCH_DELAY_MS: number = 500; // Delay between batches in milliseconds to avoid rate limits
+
 // --- Type Definitions ---
 
 interface SpotifyTrack {
@@ -68,6 +71,7 @@ interface PlaylistStatus {
     playlistUrl?: string;
     error?: string;
     timestamp: number;
+    progress?: string; // Added for progress updates
 }
 
 // --- Helper Functions ---
@@ -234,9 +238,6 @@ async function fetchLastFmPlayCount(artistName: string, trackName: string, lastF
     const url: string = `${LASTFM_API_BASE_URL}?${encodeQueryParams(params)}`;
 
     try {
-        // Add a small delay to avoid hitting Last.fm rate limits too quickly
-        await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay
-
         const response: Response = await fetch(url);
         if (!response.ok) {
             console.warn(`Last.fm API Error (${response.status}) for ${artistName} - ${trackName}`);
@@ -253,6 +254,28 @@ async function fetchLastFmPlayCount(artistName: string, trackName: string, lastF
         return null;
     }
 }
+
+/**
+ * Fetches Last.fm play counts for a batch of tracks concurrently.
+ * @param {SpotifyTrack[]} tracksBatch - The batch of Spotify tracks.
+ * @param {string} lastFmApiKey - Your Last.fm API key.
+ * @param {string} lastFmUsername - Your Last.fm username.
+ * @returns {Promise<TrackWithPlayCount[]>} Tracks with their fetched play counts.
+ */
+async function fetchLastFmPlayCountsBatch(
+    tracksBatch: SpotifyTrack[],
+    lastFmApiKey: string,
+    lastFmUsername: string
+): Promise<TrackWithPlayCount[]> {
+    const promises = tracksBatch.map(async (track) => {
+        const artistName = track.artists.map(a => a.name).join(', ');
+        const trackName = track.name;
+        const playCount = await fetchLastFmPlayCount(artistName, trackName, lastFmApiKey, lastFmUsername);
+        return { ...track, lastFmPlayCount: playCount };
+    });
+    return Promise.all(promises);
+}
+
 
 /**
  * Implements the custom shuffle logic based on Last.fm play counts.
@@ -366,7 +389,8 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'fetching_liked_songs',
             message: 'Fetching liked songs from Spotify...',
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            progress: '0%'
         } as PlaylistStatus));
 
         const likedTracks: SpotifyTrack[] = await fetchAllLikedSongs(accessToken);
@@ -374,29 +398,44 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
             await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
                 status: 'completed',
                 message: 'No liked songs found in your Spotify library.',
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                progress: '100%'
             } as PlaylistStatus));
             return;
         }
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'fetching_lastfm_counts',
-            message: `Fetching Last.fm play counts for ${likedTracks.length} tracks...`,
-            timestamp: Date.now()
+            message: `Fetching Last.fm play counts for ${likedTracks.length} tracks (this may take a while)...`,
+            timestamp: Date.now(),
+            progress: '10%'
         } as PlaylistStatus));
 
         const tracksWithPlayCounts: TrackWithPlayCount[] = [];
-        for (const track of likedTracks) {
-            const artistName: string = track.artists.map((a: { name: string }) => a.name).join(', ');
-            const trackName: string = track.name;
-            const playCount: number | null = await fetchLastFmPlayCount(artistName, trackName, LASTFM_API_KEY, LASTFM_USERNAME);
-            tracksWithPlayCounts.push({ ...track, lastFmPlayCount: playCount });
+        for (let i = 0; i < likedTracks.length; i += LASTFM_BATCH_SIZE) {
+            const batch = likedTracks.slice(i, i + LASTFM_BATCH_SIZE);
+            const processedBatch = await fetchLastFmPlayCountsBatch(batch, LASTFM_API_KEY, LASTFM_USERNAME);
+            tracksWithPlayCounts.push(...processedBatch);
+
+            const progressPercentage = Math.min(90, Math.floor(((i + batch.length) / likedTracks.length) * 80) + 10); // 10% to 90% for Last.fm fetch
+            await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+                status: 'fetching_lastfm_counts',
+                message: `Fetching Last.fm play counts: ${tracksWithPlayCounts.length}/${likedTracks.length} tracks processed.`,
+                timestamp: Date.now(),
+                progress: `${progressPercentage}%`
+            } as PlaylistStatus));
+
+            // Add delay between batches to respect Last.fm rate limits
+            if (i + LASTFM_BATCH_SIZE < likedTracks.length) {
+                await new Promise(resolve => setTimeout(resolve, LASTFM_BATCH_DELAY_MS));
+            }
         }
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'applying_shuffle_logic',
             message: 'Applying cumulative shuffle logic...',
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            progress: '90%'
         } as PlaylistStatus));
 
         const shuffledTracks: TrackWithPlayCount[] = await applyShuffleLogic(tracksWithPlayCounts);
@@ -404,7 +443,8 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'creating_playlist',
             message: 'Creating new Spotify playlist...',
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            progress: '95%'
         } as PlaylistStatus));
 
         const playlistName: string = `Shuffled Liked Songs (Cumulative Plays) - ${new Date().toLocaleString()}`;
@@ -415,7 +455,8 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'adding_tracks',
             message: `Adding ${shuffledTracks.length} tracks to playlist...`,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            progress: '98%'
         } as PlaylistStatus));
 
         const trackUris: string[] = shuffledTracks.map((track: TrackWithPlayCount) => track.uri);
@@ -425,8 +466,9 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
             status: 'completed',
             message: `Successfully created and populated playlist: ${playlistName}`,
             playlistUrl: playlistUrl,
-            timestamp: Date.now()
-        } as PlaylistStatus));
+            timestamp: Date.now(),
+            progress: '100%'
+        } as PlaylistStatus), { expirationTtl: 3600 }); // Store completed status for 1 hour
 
     } catch (error: any) {
         console.error(`Playlist generation failed for process ${processId}:`, error);
@@ -434,8 +476,9 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
             status: 'failed',
             message: 'Playlist generation failed.',
             error: error.message || 'Unknown error',
-            timestamp: Date.now()
-        } as PlaylistStatus));
+            timestamp: Date.now(),
+            progress: '100%'
+        } as PlaylistStatus), { expirationTtl: 3600 }); // Store failed status for 1 hour
     }
 }
 
@@ -534,13 +577,17 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
                 status: 'pending',
                 message: 'Playlist generation process initiated.',
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                progress: '0%'
             } as PlaylistStatus));
 
             // Start the playlist generation in the background
             event.waitUntil(startPlaylistGeneration(userId, accessToken, spotifyUserId, processId));
 
-            return new Response(`Playlist generation started! Check status at /status/${processId}`, { status: 202 }); // 202 Accepted
+            return new Response(`Playlist generation started! Check status at <a href="/status/${processId}" target="_blank">/status/${processId}</a>`, {
+                headers: { 'Content-Type': 'text/html' },
+                status: 202
+            });
 
         } else if (path.startsWith('/status/')) {
             const processId: string = path.substring('/status/'.length);
@@ -549,11 +596,11 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             const statusDataStr: string | null = await SPOTIFY_TOKENS.get(statusKey);
 
             if (!statusDataStr) {
-                return new Response('Process ID not found or expired.', { status: 404 });
+                return new Response('Process ID not found or expired. Status messages are retained for 1 hour after completion/failure.', { status: 404 });
             }
 
             const status: PlaylistStatus = JSON.parse(statusDataStr);
-            return new Response(JSON.stringify(status), {
+            return new Response(JSON.stringify(status, null, 2), { // Pretty print JSON
                 headers: { 'Content-Type': 'application/json' },
                 status: 200
             });
