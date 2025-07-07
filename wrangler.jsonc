@@ -1,5 +1,11 @@
 {
   "name": "shuffle",
   "main": "src/index.ts",
-  "compatibility_date": "2024-07-03"
+  "compatibility_date": "2024-07-03",
+  "kv_namespaces": [
+    {
+      "binding": "SPOTIFY_TOKENS",
+      "id": "SPOTIFY_TOKENS"
+    }
+  ]
 }
