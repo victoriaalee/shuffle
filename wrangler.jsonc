@@ -10,7 +10,7 @@
   ],
   "vars": {
     "SPOTIFY_CLIENT_ID": "c152f0af11654123aeaa21fc0fec317c",
-    "SPOTIFY_REDIRECT_URI": "4251d67a4a9412a4849bf9048c1533a2",
+    "SPOTIFY_REDIRECT_URI": "https://shuffle.ambitious-victorialee.workers.dev/callback",
     "LASTFM_USERNAME": "victoriaalee"
   }
 }
