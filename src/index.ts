@@ -603,9 +603,13 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
         userId = generateRandomString(32); // Generate a new unique ID
         setCookieHeader = `userId=${userId}; Path=/; Max-Age=${60 * 60 * 24 * 365}; HttpOnly; Secure; SameSite=Lax`; // 1 year expiry
         console.log(`New user session: ${userId}`);
+    } else {
+        console.log(`Existing user session: ${userId}`);
     }
 
     try {
+        let response: Response;
+
         if (path === '/login') {
             // Spotify OAuth initiation
             const state: string = generateRandomString(16);
@@ -619,11 +623,7 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
                 state: state,
             });
 
-            const response = Response.redirect(`${SPOTIFY_AUTH_URL}?${queryParams}`, 302);
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
+            response = Response.redirect(`${SPOTIFY_AUTH_URL}?${queryParams}`, 302);
 
         } else if (path === '/callback') {
             // Spotify OAuth callback
@@ -632,101 +632,93 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             const error: string | null = url.searchParams.get('error');
 
             if (error) {
-                return new Response(`Spotify authorization error: ${error}`, { status: 400 });
+                response = new Response(`Spotify authorization error: ${error}`, { status: 400 });
+            } else if (!code) {
+                response = new Response('Missing authorization code in Spotify callback.', { status: 400 });
+            } else if (!userId) {
+                response = new Response('User ID missing from cookie for Spotify callback. Please clear cookies and try again.', { status: 400 });
+            } else {
+                const client_id: string = SPOTIFY_CLIENT_ID;
+                const client_secret: string = SPOTIFY_CLIENT_SECRET;
+                const redirect_uri: string = SPOTIFY_REDIRECT_URI;
+
+                const authHeader: string = btoa(`${client_id}:${client_secret}`);
+
+                const tokenResponse: Response = await fetch(SPOTIFY_TOKEN_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Basic ${authHeader}`,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: encodeQueryParams({
+                        grant_type: 'authorization_code',
+                        code: code,
+                        redirect_uri: redirect_uri,
+                    }),
+                });
+
+                if (!tokenResponse.ok) {
+                    const errorData: any = await tokenResponse.json().catch(() => ({ message: 'Unknown error' }));
+                    console.error('Spotify token exchange failed:', errorData);
+                    response = new Response(`Failed to exchange code for Spotify token: ${tokenResponse.status} - ${errorData.error_description || errorData.error}`, { status: 500 });
+                } else {
+                    const tokenData: any = await tokenResponse.json();
+                    const accessToken: string = tokenData.access_token;
+                    const refreshToken: string = tokenData.refresh_token;
+                    const expiresIn: number = tokenData.expires_in;
+
+                    // Retrieve existing user credentials to update only Spotify part
+                    const existingCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
+                    let userCreds: UserCredentials = existingCredsStr ? JSON.parse(existingCredsStr) : {};
+                    userCreds.spotify = {
+                        access_token: accessToken,
+                        refresh_token: refreshToken,
+                        expires_at: Date.now() + (expiresIn * 1000)
+                    };
+                    await SPOTIFY_TOKENS.put(userId, JSON.stringify(userCreds));
+                    console.log(`[${userId}] Spotify credentials saved to KV.`);
+
+                    response = new Response('Successfully logged in to Spotify! Now, please log in to Last.fm: <a href="/lastfm-login">Last.fm Login</a>', {
+                        headers: { 'Content-Type': 'text/html' },
+                        status: 200
+                    });
+                }
             }
-            if (!code) {
-                return new Response('Missing authorization code in Spotify callback.', { status: 400 });
-            }
-            if (!userId) { // Should not happen if cookie is handled correctly, but good to check
-                return new Response('User ID missing from cookie for Spotify callback.', { status: 400 });
-            }
-
-            const client_id: string = SPOTIFY_CLIENT_ID;
-            const client_secret: string = SPOTIFY_CLIENT_SECRET;
-            const redirect_uri: string = SPOTIFY_REDIRECT_URI;
-
-            const authHeader: string = btoa(`${client_id}:${client_secret}`);
-
-            const tokenResponse: Response = await fetch(SPOTIFY_TOKEN_URL, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Basic ${authHeader}`,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: encodeQueryParams({
-                    grant_type: 'authorization_code',
-                    code: code,
-                    redirect_uri: redirect_uri,
-                }),
-            });
-
-            if (!tokenResponse.ok) {
-                const errorData: any = await tokenResponse.json().catch(() => ({ message: 'Unknown error' }));
-                console.error('Spotify token exchange failed:', errorData);
-                return new Response(`Failed to exchange code for Spotify token: ${tokenResponse.status} - ${errorData.error_description || errorData.error}`, { status: 500 });
-            }
-
-            const tokenData: any = await tokenResponse.json();
-            const accessToken: string = tokenData.access_token;
-            const refreshToken: string = tokenData.refresh_token;
-            const expiresIn: number = tokenData.expires_in;
-
-            // Retrieve existing user credentials to update only Spotify part
-            const existingCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
-            let userCreds: UserCredentials = existingCredsStr ? JSON.parse(existingCredsStr) : {};
-            userCreds.spotify = {
-                access_token: accessToken,
-                refresh_token: refreshToken,
-                expires_at: Date.now() + (expiresIn * 1000)
-            };
-            await SPOTIFY_TOKENS.put(userId, JSON.stringify(userCreds));
-
-            const response = new Response('Successfully logged in to Spotify! Now, please log in to Last.fm: <a href="/lastfm-login">Last.fm Login</a>', {
-                headers: { 'Content-Type': 'text/html' },
-                status: 200
-            });
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
 
         } else if (path === '/lastfm-login') {
             // Last.fm OAuth Step 1: Get a request token
             if (!userId) {
-                return new Response('User ID missing. Please start from the main page.', { status: 400 });
+                response = new Response('User ID missing. Please start from the main page.', { status: 400 });
+            } else {
+                const params: Record<string, string> = {
+                    method: 'auth.getToken',
+                    api_key: LASTFM_API_KEY
+                };
+                const api_sig = await generateLastFmApiSignature(params, LASTFM_SHARED_SECRET);
+                const tokenUrl = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig, format: 'json' })}`;
+
+                const tokenResponse = await fetch(tokenUrl);
+                if (!tokenResponse.ok) {
+                    const errorData = await tokenResponse.json().catch(() => ({ message: 'Unknown error' }));
+                    console.error('Last.fm getToken failed:', errorData);
+                    response = new Response(`Failed to get Last.fm request token: ${tokenResponse.status} - ${errorData.message || 'Unknown error'}`, { status: 500 });
+                } else {
+                    const tokenData = await tokenResponse.json();
+                    const requestToken = tokenData.token;
+
+                    if (!requestToken) {
+                        response = new Response('Failed to retrieve Last.fm request token.', { status: 500 });
+                    } else {
+                        // Store the request token temporarily, keyed by userId
+                        await SPOTIFY_TOKENS.put(LASTFM_REQUEST_TOKEN_PREFIX + userId, requestToken, { expirationTtl: 60 * 5 }); // Valid for 5 minutes
+                        console.log(`[${userId}] Last.fm request token stored in KV.`);
+
+                        // Last.fm OAuth Step 2: Redirect user for authorization
+                        const authRedirectUrl = `${LASTFM_AUTH_URL}?api_key=${LASTFM_API_KEY}&token=${requestToken}&cb=${encodeURIComponent(url.origin + '/lastfm-callback')}`;
+                        response = Response.redirect(authRedirectUrl, 302);
+                    }
+                }
             }
-
-            const params: Record<string, string> = {
-                method: 'auth.getToken',
-                api_key: LASTFM_API_KEY
-            };
-            const api_sig = await generateLastFmApiSignature(params, LASTFM_SHARED_SECRET);
-            const tokenUrl = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig, format: 'json' })}`;
-
-            const tokenResponse = await fetch(tokenUrl);
-            if (!tokenResponse.ok) {
-                const errorData = await tokenResponse.json().catch(() => ({ message: 'Unknown error' }));
-                console.error('Last.fm getToken failed:', errorData);
-                return new Response(`Failed to get Last.fm request token: ${tokenResponse.status} - ${errorData.message || 'Unknown error'}`, { status: 500 });
-            }
-            const tokenData = await tokenResponse.json();
-            const requestToken = tokenData.token;
-
-            if (!requestToken) {
-                return new Response('Failed to retrieve Last.fm request token.', { status: 500 });
-            }
-
-            // Store the request token temporarily, keyed by userId
-            await SPOTIFY_TOKENS.put(LASTFM_REQUEST_TOKEN_PREFIX + userId, requestToken, { expirationTtl: 60 * 5 }); // Valid for 5 minutes
-
-            // Last.fm OAuth Step 2: Redirect user for authorization
-            const authRedirectUrl = `${LASTFM_AUTH_URL}?api_key=${LASTFM_API_KEY}&token=${requestToken}&cb=${encodeURIComponent(url.origin + '/lastfm-callback')}`;
-
-            const response = Response.redirect(authRedirectUrl, 302);
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
 
         } else if (path === '/lastfm-callback') {
             // Last.fm OAuth Step 3: Exchange token for session key
@@ -734,127 +726,124 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             const error = url.searchParams.get('error');
 
             if (error) {
-                return new Response(`Last.fm authorization error: ${error}`, { status: 400 });
-            }
-            if (!token) {
-                return new Response('Missing authorization token in Last.fm callback.', { status: 400 });
-            }
-            if (!userId) {
-                return new Response('User ID missing from cookie for Last.fm callback.', { status: 400 });
-            }
+                response = new Response(`Last.fm authorization error: ${error}`, { status: 400 });
+            } else if (!token) {
+                response = new Response('Missing authorization token in Last.fm callback.', { status: 400 });
+            } else if (!userId) {
+                response = new Response('User ID missing from cookie for Last.fm callback. Please clear cookies and try again.', { status: 400 });
+            } else {
+                // Retrieve the stored request token
+                const storedRequestToken = await SPOTIFY_TOKENS.get(LASTFM_REQUEST_TOKEN_PREFIX + userId);
+                if (!storedRequestToken || storedRequestToken !== token) {
+                    response = new Response('Invalid or expired Last.fm request token. Please try Last.fm login again.', { status: 400 });
+                } else {
+                    // Delete the used request token
+                    await SPOTIFY_TOKENS.delete(LASTFM_REQUEST_TOKEN_PREFIX + userId);
 
-            // Retrieve the stored request token
-            const storedRequestToken = await SPOTIFY_TOKENS.get(LASTFM_REQUEST_TOKEN_PREFIX + userId);
-            if (!storedRequestToken || storedRequestToken !== token) {
-                return new Response('Invalid or expired Last.fm request token. Please try Last.fm login again.', { status: 400 });
+                    const params: Record<string, string> = {
+                        method: 'auth.getSession',
+                        api_key: LASTFM_API_KEY,
+                        token: token
+                    };
+                    const api_sig = await generateLastFmApiSignature(params, LASTFM_SHARED_SECRET);
+                    const sessionUrl = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig, format: 'json' })}`;
+
+                    const sessionResponse = await fetch(sessionUrl);
+                    if (!sessionResponse.ok) {
+                        const errorData = await sessionResponse.json().catch(() => ({ message: 'Unknown error' }));
+                        console.error('Last.fm getSession failed:', errorData);
+                        response = new Response(`Failed to get Last.fm session key: ${sessionResponse.status} - ${errorData.message || 'Unknown error'}`, { status: 500 });
+                    } else {
+                        const sessionData = await sessionResponse.json();
+                        const sessionKey = sessionData.session?.key;
+                        const lastFmUsername = sessionData.session?.name;
+
+                        if (!sessionKey || !lastFmUsername) {
+                            response = new Response('Failed to retrieve Last.fm session key or username from Last.fm API response.', { status: 500 });
+                        } else {
+                            // Retrieve existing user credentials to update only Last.fm part
+                            const existingCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
+                            let userCreds: UserCredentials = existingCredsStr ? JSON.parse(existingCredsStr) : {};
+                            userCreds.lastFm = {
+                                username: lastFmUsername,
+                                sessionKey: sessionKey
+                            };
+                            await SPOTIFY_TOKENS.put(userId, JSON.stringify(userCreds));
+                            console.log(`[${userId}] Last.fm credentials saved to KV for user: ${lastFmUsername}.`);
+
+                            response = new Response(`Successfully logged in to Last.fm as ${lastFmUsername}! You can now shuffle your songs: <a href="/shuffle">Shuffle Songs</a>`, {
+                                headers: { 'Content-Type': 'text/html' },
+                                status: 200
+                            });
+                        }
+                    }
+                }
             }
-            // Delete the used request token
-            await SPOTIFY_TOKENS.delete(LASTFM_REQUEST_TOKEN_PREFIX + userId);
-
-            const params: Record<string, string> = {
-                method: 'auth.getSession',
-                api_key: LASTFM_API_KEY,
-                token: token
-            };
-            const api_sig = await generateLastFmApiSignature(params, LASTFM_SHARED_SECRET);
-            const sessionUrl = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig, format: 'json' })}`;
-
-            const sessionResponse = await fetch(sessionUrl);
-            if (!sessionResponse.ok) {
-                const errorData = await sessionResponse.json().catch(() => ({ message: 'Unknown error' }));
-                console.error('Last.fm getSession failed:', errorData);
-                return new Response(`Failed to get Last.fm session key: ${sessionResponse.status} - ${errorData.message || 'Unknown error'}`, { status: 500 });
-            }
-            const sessionData = await sessionResponse.json();
-            const sessionKey = sessionData.session.key;
-            const lastFmUsername = sessionData.session.name;
-
-            if (!sessionKey || !lastFmUsername) {
-                return new Response('Failed to retrieve Last.fm session key or username.', { status: 500 });
-            }
-
-            // Retrieve existing user credentials to update only Last.fm part
-            const existingCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
-            let userCreds: UserCredentials = existingCredsStr ? JSON.parse(existingCredsStr) : {};
-            userCreds.lastFm = {
-                username: lastFmUsername,
-                sessionKey: sessionKey
-            };
-            await SPOTIFY_TOKENS.put(userId, JSON.stringify(userCreds));
-
-            const response = new Response(`Successfully logged in to Last.fm as ${lastFmUsername}! You can now shuffle your songs: <a href="/shuffle">Shuffle Songs</a>`, {
-                headers: { 'Content-Type': 'text/html' },
-                status: 200
-            });
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
 
         } else if (path === '/shuffle') {
             if (!userId) {
-                return new Response('User ID missing. Please start from the main page.', { status: 400 });
+                response = new Response('User ID missing. Please start from the main page.', { status: 400 });
+            } else {
+                // Retrieve all user credentials
+                const userCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
+                console.log(`[${userId}] Retrieved userCredsStr from KV: ${userCredsStr ? 'present' : 'absent'}`);
+
+                if (!userCredsStr) {
+                    response = new Response('No user credentials found. Please log in to Spotify and Last.fm first.', { status: 401 });
+                } else {
+                    const userCreds: UserCredentials = JSON.parse(userCredsStr);
+                    console.log(`[${userId}] Parsed userCreds: ${JSON.stringify(userCreds)}`);
+
+                    const spotifyAccessToken = userCreds.spotify?.access_token;
+                    const lastFmUsername = userCreds.lastFm?.username;
+                    const lastFmSessionKey = userCreds.lastFm?.sessionKey;
+
+                    if (!spotifyAccessToken) {
+                        response = new Response('Spotify not authenticated. Please visit <a href="/login">/login</a> first.', {
+                            headers: { 'Content-Type': 'text/html' },
+                            status: 401
+                        });
+                    } else if (!lastFmUsername || !lastFmSessionKey) {
+                        response = new Response('Last.fm not authenticated. Please visit <a href="/lastfm-login">/lastfm-login</a> first.', {
+                            headers: { 'Content-Type': 'text/html' },
+                            status: 401
+                        });
+                    } else {
+                        // Get Spotify User ID (needed for playlist creation)
+                        const userProfile: any = await spotifyApiFetch(`${SPOTIFY_API_BASE_URL}/me`, spotifyAccessToken);
+                        const spotifyUserId: string = userProfile.id;
+
+                        const processId: string = generateRandomString(20); // Unique ID for this process
+                        const statusKey = STATUS_KEY_PREFIX + processId;
+
+                        // Store initial pending status
+                        await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+                            status: 'pending',
+                            message: 'Playlist generation process initiated.',
+                            timestamp: Date.now(),
+                            progress: '0%'
+                        } as PlaylistStatus));
+                        console.log(`[${userId}] Starting playlist generation for process: ${processId}`);
+
+                        // Start the playlist generation in the background
+                        event.waitUntil(startPlaylistGeneration(
+                            userId,
+                            spotifyAccessToken,
+                            spotifyUserId,
+                            LASTFM_API_KEY,
+                            LASTFM_SHARED_SECRET,
+                            lastFmUsername,
+                            lastFmSessionKey,
+                            processId
+                        ));
+
+                        response = new Response(`Playlist generation started! Check status at <a href="/status/${processId}" target="_blank">/status/${processId}</a>`, {
+                            headers: { 'Content-Type': 'text/html' },
+                            status: 202
+                        });
+                    }
+                }
             }
-
-            // Retrieve all user credentials
-            const userCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
-            if (!userCredsStr) {
-                return new Response('No user credentials found. Please log in to Spotify and Last.fm first.', { status: 401 });
-            }
-            const userCreds: UserCredentials = JSON.parse(userCredsStr);
-
-            const spotifyAccessToken = userCreds.spotify?.access_token;
-            const lastFmUsername = userCreds.lastFm?.username;
-            const lastFmSessionKey = userCreds.lastFm?.sessionKey;
-
-            if (!spotifyAccessToken) {
-                return new Response('Spotify not authenticated. Please visit <a href="/login">/login</a> first.', {
-                    headers: { 'Content-Type': 'text/html' },
-                    status: 401
-                });
-            }
-            if (!lastFmUsername || !lastFmSessionKey) {
-                return new Response('Last.fm not authenticated. Please visit <a href="/lastfm-login">/lastfm-login</a> first.', {
-                    headers: { 'Content-Type': 'text/html' },
-                    status: 401
-                });
-            }
-
-            // Get Spotify User ID (needed for playlist creation)
-            const userProfile: any = await spotifyApiFetch(`${SPOTIFY_API_BASE_URL}/me`, spotifyAccessToken);
-            const spotifyUserId: string = userProfile.id;
-
-            const processId: string = generateRandomString(20); // Unique ID for this process
-            const statusKey = STATUS_KEY_PREFIX + processId;
-
-            // Store initial pending status
-            await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
-                status: 'pending',
-                message: 'Playlist generation process initiated.',
-                timestamp: Date.now(),
-                progress: '0%'
-            } as PlaylistStatus));
-
-            // Start the playlist generation in the background
-            event.waitUntil(startPlaylistGeneration(
-                userId,
-                spotifyAccessToken,
-                spotifyUserId,
-                LASTFM_API_KEY,
-                LASTFM_SHARED_SECRET,
-                lastFmUsername,
-                lastFmSessionKey,
-                processId
-            ));
-
-            const response = new Response(`Playlist generation started! Check status at <a href="/status/${processId}" target="_blank">/status/${processId}</a>`, {
-                headers: { 'Content-Type': 'text/html' },
-                status: 202
-            });
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
 
         } else if (path.startsWith('/status/')) {
             const processId: string = path.substring('/status/'.length);
@@ -863,22 +852,18 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             const statusDataStr: string | null = await SPOTIFY_TOKENS.get(statusKey);
 
             if (!statusDataStr) {
-                return new Response('Process ID not found or expired. Status messages are retained for 1 hour after completion/failure.', { status: 404 });
+                response = new Response('Process ID not found or expired. Status messages are retained for 1 hour after completion/failure.', { status: 404 });
+            } else {
+                const status: PlaylistStatus = JSON.parse(statusDataStr);
+                response = new Response(JSON.stringify(status, null, 2), { // Pretty print JSON
+                    headers: { 'Content-Type': 'application/json' },
+                    status: 200
+                });
             }
-
-            const status: PlaylistStatus = JSON.parse(statusDataStr);
-            const response = new Response(JSON.stringify(status, null, 2), { // Pretty print JSON
-                headers: { 'Content-Type': 'application/json' },
-                status: 200
-            });
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
 
         } else {
             // Default route
-            const response = new Response(`
+            response = new Response(`
                 <h1>Spotify Liked Songs Shuffler Worker (Multi-User)</h1>
                 <p>Welcome! This worker helps you shuffle your Spotify liked songs into a new playlist, prioritizing least played songs using Last.fm data.</p>
                 <p><strong>Important:</strong> You need to authenticate with both Spotify and Last.fm.</p>
@@ -890,17 +875,20 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
                 </ul>
                 <p>Make sure you have set up the required environment variables (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, <strong>LASTFM_API_KEY, LASTFM_SHARED_SECRET</strong>) and a KV namespace (SPOTIFY_TOKENS) in your Cloudflare Worker settings.</p>
             `, { headers: { 'Content-Type': 'text/html' } });
-            if (setCookieHeader) {
-                response.headers.set('Set-Cookie', setCookieHeader);
-            }
-            return response;
         }
-    } catch (error: any) {
-        console.error('Worker error:', error);
-        const response = new Response(`An error occurred: ${error.message}`, { status: 500 });
+
+        // Always set the userId cookie on every response
         if (setCookieHeader) {
             response.headers.set('Set-Cookie', setCookieHeader);
         }
         return response;
+
+    } catch (error: any) {
+        console.error('Worker error:', error);
+        const errorResponse = new Response(`An error occurred: ${error.message}`, { status: 500 });
+        if (setCookieHeader) {
+            errorResponse.headers.set('Set-Cookie', setCookieHeader);
+        }
+        return errorResponse;
     }
 }
