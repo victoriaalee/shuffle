@@ -657,6 +657,7 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
 
         } else {
             return new Response(`
+                <img src="https://www.dumpleandfriends.com/img/smallanimals.png">
                 <h1>Spotify Liked Songs Shuffler Worker</h1>
                 <p>Welcome! This worker helps you shuffle your Spotify liked songs into a new playlist, prioritizing least played songs using Last.fm data.</p>
                 <p><strong>Important:</strong> You need to configure Spotify and Last.fm API keys and your Last.fm username as environment variables in your Cloudflare Worker settings.</p>
