@@ -7,6 +7,8 @@
  * and creates a new Spotify playlist where songs are cumulatively shuffled
  * based on their play count (least played first).
  *
+ * ONLY SONGS THAT HAVE A PLAY COUNT RECORDED IN LAST.FM ARE INCLUDED.
+ *
  * The /shuffle endpoint returns immediately, and the playlist creation
  * happens asynchronously. A new /status/:processId endpoint allows checking
  * the progress and results.
@@ -57,7 +59,7 @@ interface SpotifyTrack {
 }
 
 interface TrackWithPlayCount extends SpotifyTrack {
-    lastFmPlayCount: number | null;
+    lastFmPlayCount: number | null; // Can be null if not found in Last.fm
 }
 
 interface SpotifyTokenData {
@@ -301,7 +303,9 @@ async function applyShuffleLogic(tracks: TrackWithPlayCount[]): Promise<TrackWit
     let maxPlayCount: number = 0;
 
     for (const track of tracks) {
-        const effectivePlayCount: number = track.lastFmPlayCount !== null ? track.lastFmPlayCount : 0;
+        // Ensure that tracks with null play counts (not found in Last.fm) are not processed here.
+        // This function should only receive tracks that already have a play count (even if 0).
+        const effectivePlayCount: number = track.lastFmPlayCount !== null ? track.lastFmPlayCount : 0; // Should not be null at this point
         if (!playCountGroups.has(effectivePlayCount)) {
             playCountGroups.set(effectivePlayCount, []);
         }
@@ -407,7 +411,7 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'fetching_lastfm_top_tracks',
-            message: 'Fetching Last.fm top tracks...',
+            message: 'Fetching Last.fm top tracks (this may take a while for large libraries)...',
             timestamp: Date.now(),
             progress: '10%'
         } as PlaylistStatus));
@@ -423,7 +427,7 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'matching_tracks',
-            message: `Matching ${likedTracks.length} Spotify songs with Last.fm data...`,
+            message: `Matching ${likedTracks.length} Spotify songs with Last.fm data and filtering...`,
             timestamp: Date.now(),
             progress: '50%'
         } as PlaylistStatus));
@@ -433,9 +437,24 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
             const normalizedArtist = track.artists.map(a => a.name).join(', ').toLowerCase().trim();
             const normalizedTrack = track.name.toLowerCase().trim();
             const playCount = lastFmPlayCountMap.get(`${normalizedArtist} - ${normalizedTrack}`);
-            tracksWithPlayCounts.push({ ...track, lastFmPlayCount: playCount !== undefined ? playCount : 0 }); // Default to 0 plays if not found
+
+            // Only push the track if a play count was found in Last.fm
+            if (playCount !== undefined) {
+                tracksWithPlayCounts.push({ ...track, lastFmPlayCount: playCount });
+            }
         }
-        console.log('Finished matching Last.fm play counts.');
+        console.log(`Finished matching Last.fm play counts. ${tracksWithPlayCounts.length} tracks included.`);
+
+        if (tracksWithPlayCounts.length === 0) {
+            await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
+                status: 'completed',
+                message: 'No liked songs found with Last.fm play counts. Playlist not created.',
+                timestamp: Date.now(),
+                progress: '100%'
+            } as PlaylistStatus));
+            return;
+        }
+
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'applying_shuffle_logic',
