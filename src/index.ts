@@ -1,11 +1,11 @@
 /**
  * Cloudflare Worker for Spotify Liked Songs Shuffle with Last.fm Play Counts (TypeScript)
  *
- * This worker authenticates with Spotify and Last.fm for individual users.
- * It fetches a user's liked songs from Spotify, then their top tracks from Last.fm
- * to get play counts. It matches Spotify songs to Last.fm top tracks, assigns play counts,
- * and creates a new Spotify playlist where songs are cumulatively shuffled
- * based on their play count (least played first).
+ * This worker authenticates with Spotify for individual users.
+ * It fetches a user's liked songs from Spotify, then uses a GLOBAL Last.fm account's
+ * top tracks to get play counts. It matches Spotify songs to Last.fm top tracks,
+ * assigns play counts, and creates a new Spotify playlist where songs are
+ * cumulatively shuffled based on their play count (least played first).
  *
  * ONLY SONGS THAT HAVE A PLAY COUNT RECORDED IN LAST.FM ARE INCLUDED.
  *
@@ -19,11 +19,12 @@
  * - SPOTIFY_CLIENT_ID: Your Spotify Application Client ID
  * - SPOTIFY_CLIENT_SECRET: Your Spotify Application Client Secret
  * - SPOTIFY_REDIRECT_URI: The redirect URI configured in your Spotify App (e.g., https://your-worker-domain.workers.dev/callback)
- * - LASTFM_API_KEY: Your Last.fm API Key
- * - LASTFM_SHARED_SECRET: Your Last.fm Shared Secret (from your Last.fm API account)
+ * - LASTFM_API_KEY: Your Last.fm API Key (global)
+ * - LASTFM_SHARED_SECRET: Your Last.fm Shared Secret (global)
+ * - LASTFM_USERNAME: The Last.fm Username to fetch top tracks from (global)
  *
  * KV Namespace Required:
- * - SPOTIFY_TOKENS: A KV namespace to store user-specific Spotify and Last.fm credentials,
+ * - SPOTIFY_TOKENS: A KV namespace to store user-specific Spotify credentials,
  * and also the status of playlist generation processes.
  */
 
@@ -32,7 +33,8 @@ declare const SPOTIFY_CLIENT_ID: string;
 declare const SPOTIFY_CLIENT_SECRET: string;
 declare const SPOTIFY_REDIRECT_URI: string;
 declare const LASTFM_API_KEY: string;
-declare const LASTFM_SHARED_SECRET: string; // New: Last.fm Shared Secret
+declare const LASTFM_SHARED_SECRET: string;
+declare const LASTFM_USERNAME: string; // Global Last.fm username
 declare const SPOTIFY_TOKENS: KVNamespace;
 
 // Define constants for Spotify API endpoints
@@ -42,12 +44,11 @@ const SPOTIFY_API_BASE_URL: string = 'https://api.spotify.com/v1';
 
 // Define constants for Last.fm API endpoints
 const LASTFM_API_BASE_URL: string = 'http://ws.audioscrobbler.com/2.0/';
-const LASTFM_AUTH_URL: string = 'http://www.last.fm/api/auth/';
+// LASTFM_AUTH_URL is no longer needed as we're not doing per-user Last.fm auth
 
 // KV key prefix for storing playlist generation status
 const STATUS_KEY_PREFIX: string = 'playlist_status_';
-// KV key prefix for storing Last.fm request tokens during auth flow
-const LASTFM_REQUEST_TOKEN_PREFIX: string = 'lastfm_req_token_';
+// LASTFM_REQUEST_TOKEN_PREFIX is no longer needed
 
 // --- API Request Limits ---
 const SPOTIFY_PLAYLIST_ADD_MAX_REQUESTS: number = 40; // Max 40 Spotify API calls for adding tracks (40 * 100 = 4000 tracks)
@@ -76,14 +77,16 @@ interface SpotifyTokenData {
     expires_at: number; // Unix timestamp in milliseconds
 }
 
-interface LastFmTokenData {
-    username: string;
-    sessionKey: string;
-}
+// LastFmTokenData interface is no longer needed as it's global now
+// interface LastFmTokenData {
+//     username: string;
+//     sessionKey: string;
+// }
 
 interface UserCredentials {
     spotify?: SpotifyTokenData;
-    lastFm?: LastFmTokenData;
+    // lastFm property removed as it's global now
+    // lastFm?: LastFmTokenData;
 }
 
 interface PlaylistStatus {
@@ -274,14 +277,13 @@ async function fetchAllLikedSongs(accessToken: string): Promise<SpotifyTrack[]> 
 
 /**
  * Fetches a user's top tracks from Last.fm, handling pagination.
- * Requires a Last.fm session key for authenticated calls.
+ * Uses global Last.fm credentials.
  * @param {string} lastFmApiKey - Your Last.fm API key.
  * @param {string} lastFmSharedSecret - Your Last.fm Shared Secret.
- * @param {string} lastFmUsername - The Last.fm username.
- * @param {string} lastFmSessionKey - The Last.fm session key.
+ * @param {string} lastFmUsername - The Last.fm username (global).
  * @returns {Promise<Array<{ artist: string, name: string, playcount: number }>>} An array of top track objects.
  */
-async function fetchLastFmTopTracks(lastFmApiKey: string, lastFmSharedSecret: string, lastFmUsername: string, lastFmSessionKey: string): Promise<Array<{ artist: string, name: string, playcount: number }>> {
+async function fetchLastFmTopTracks(lastFmApiKey: string, lastFmSharedSecret: string, lastFmUsername: string): Promise<Array<{ artist: string, name: string, playcount: number }>> {
     let allTopTracks: Array<{ artist: string, name: string, playcount: number }> = [];
     let page = 1;
     let totalPages = 1; // Initialize to 1 to enter the loop
@@ -293,11 +295,19 @@ async function fetchLastFmTopTracks(lastFmApiKey: string, lastFmSharedSecret: st
             api_key: lastFmApiKey,
             limit: LASTFM_TOP_TRACKS_LIMIT_PER_PAGE,
             page: page,
-            sk: lastFmSessionKey, // Include session key
+            // No session key needed for user.getTopTracks if profile is public,
+            // but including a dummy 'sk' for signature generation consistency if needed for other methods.
+            // For user.getTopTracks, if the profile is public, it doesn't strictly need a session key.
+            // However, to generate a valid signature for *any* authenticated method, a session key might be expected.
+            // For simplicity and to avoid issues with missing 'sk' in signature, we'll omit it here
+            // as user.getTopTracks is often public. If it fails, we might need to revisit.
             format: 'json'
         };
 
-        // Generate API signature for authenticated call
+        // Generate API signature for authenticated call (even if user.getTopTracks doesn't strictly require it for public profiles)
+        // This ensures the request is correctly signed if Last.fm's policy changes or for other methods.
+        // Note: user.getTopTracks does NOT require a session key (sk) if the profile is public.
+        // The signature generation here is primarily for consistency if other authenticated methods were added.
         const api_sig = await generateLastFmApiSignature(params as Record<string, string>, lastFmSharedSecret);
         const url: string = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig })}`;
 
@@ -451,21 +461,13 @@ async function addTracksToPlaylist(accessToken: string, playlistId: string, trac
  * @param {string} userId - The user ID.
  * @param {string} spotifyAccessToken - The Spotify access token.
  * @param {string} spotifyUserId - The Spotify user ID.
- * @param {string} lastFmApiKey - The Last.fm API Key.
- * @param {string} lastFmSharedSecret - The Last.fm Shared Secret.
- * @param {string} lastFmUsername - The Last.fm Username.
- * @param {string} lastFmSessionKey - The Last.fm Session Key.
  * @param {string} processId - The unique ID for this process.
  */
 async function startPlaylistGeneration(
     userId: string,
     spotifyAccessToken: string,
     spotifyUserId: string,
-    lastFmApiKey: string,
-    lastFmSharedSecret: string,
-    lastFmUsername: string,
-    lastFmSessionKey: string,
-    processId: string
+    processId: string // lastFm credentials are now global
 ): Promise<void> {
     const statusKey = STATUS_KEY_PREFIX + processId;
 
@@ -490,12 +492,13 @@ async function startPlaylistGeneration(
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'fetching_lastfm_top_tracks',
-            message: `Fetching all Last.fm top tracks (this may take a while for large libraries)...`,
+            message: `Fetching all Last.fm top tracks from global account '${LASTFM_USERNAME}' (this may take a while for large libraries)...`,
             timestamp: Date.now(),
             progress: '10%'
         } as PlaylistStatus));
 
-        const lastFmTopTracks = await fetchLastFmTopTracks(lastFmApiKey, lastFmSharedSecret, lastFmUsername, lastFmSessionKey);
+        // Use global LASTFM_API_KEY, LASTFM_SHARED_SECRET, and LASTFM_USERNAME
+        const lastFmTopTracks = await fetchLastFmTopTracks(LASTFM_API_KEY, LASTFM_SHARED_SECRET, LASTFM_USERNAME);
         const lastFmPlayCountMap = new Map<string, number>(); // Key: "ArtistName - TrackName" (normalized)
 
         for (const track of lastFmTopTracks) {
@@ -678,105 +681,10 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
                     await SPOTIFY_TOKENS.put(userId, JSON.stringify(userCreds));
                     console.log(`[${userId}] Spotify credentials saved to KV.`);
 
-                    response = new Response('Successfully logged in to Spotify! Now, please log in to Last.fm: <a href="/lastfm-login">Last.fm Login</a>', {
+                    response = new Response('Successfully logged in to Spotify! You can now shuffle your songs: <a href="/shuffle">Shuffle Songs</a>', {
                         headers: { 'Content-Type': 'text/html' },
                         status: 200
                     });
-                }
-            }
-
-        } else if (path === '/lastfm-login') {
-            // Last.fm OAuth Step 1: Get a request token
-            if (!userId) {
-                response = new Response('User ID missing. Please start from the main page.', { status: 400 });
-            } else {
-                const params: Record<string, string> = {
-                    method: 'auth.getToken',
-                    api_key: LASTFM_API_KEY
-                };
-                const api_sig = await generateLastFmApiSignature(params, LASTFM_SHARED_SECRET);
-                const tokenUrl = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig, format: 'json' })}`;
-
-                const tokenResponse = await fetch(tokenUrl);
-                if (!tokenResponse.ok) {
-                    const errorData = await tokenResponse.json().catch(() => ({ message: 'Unknown error' }));
-                    console.error('Last.fm getToken failed:', errorData);
-                    response = new Response(`Failed to get Last.fm request token: ${tokenResponse.status} - ${errorData.message || 'Unknown error'}`, { status: 500 });
-                } else {
-                    const tokenData = await tokenResponse.json();
-                    const requestToken = tokenData.token;
-
-                    if (!requestToken) {
-                        response = new Response('Failed to retrieve Last.fm request token.', { status: 500 });
-                    } else {
-                        // Store the request token temporarily, keyed by userId
-                        await SPOTIFY_TOKENS.put(LASTFM_REQUEST_TOKEN_PREFIX + userId, requestToken, { expirationTtl: 60 * 5 }); // Valid for 5 minutes
-                        console.log(`[${userId}] Last.fm request token stored in KV.`);
-
-                        // Last.fm OAuth Step 2: Redirect user for authorization
-                        const authRedirectUrl = `${LASTFM_AUTH_URL}?api_key=${LASTFM_API_KEY}&token=${requestToken}&cb=${encodeURIComponent(url.origin + '/lastfm-callback')}`;
-                        response = Response.redirect(authRedirectUrl, 302);
-                    }
-                }
-            }
-
-        } else if (path === '/lastfm-callback') {
-            // Last.fm OAuth Step 3: Exchange token for session key
-            const token = url.searchParams.get('token');
-            const error = url.searchParams.get('error');
-
-            if (error) {
-                response = new Response(`Last.fm authorization error: ${error}`, { status: 400 });
-            } else if (!token) {
-                response = new Response('Missing authorization token in Last.fm callback.', { status: 400 });
-            } else if (!userId) {
-                response = new Response('User ID missing from cookie for Last.fm callback. Please clear cookies and try again.', { status: 400 });
-            } else {
-                // Retrieve the stored request token
-                const storedRequestToken = await SPOTIFY_TOKENS.get(LASTFM_REQUEST_TOKEN_PREFIX + userId);
-                if (!storedRequestToken || storedRequestToken !== token) {
-                    response = new Response('Invalid or expired Last.fm request token. Please try Last.fm login again.', { status: 400 });
-                } else {
-                    // Delete the used request token
-                    await SPOTIFY_TOKENS.delete(LASTFM_REQUEST_TOKEN_PREFIX + userId);
-
-                    const params: Record<string, string> = {
-                        method: 'auth.getSession',
-                        api_key: LASTFM_API_KEY,
-                        token: token
-                    };
-                    const api_sig = await generateLastFmApiSignature(params, LASTFM_SHARED_SECRET);
-                    const sessionUrl = `${LASTFM_API_BASE_URL}?${encodeQueryParams({ ...params, api_sig: api_sig, format: 'json' })}`;
-
-                    const sessionResponse = await fetch(sessionUrl);
-                    if (!sessionResponse.ok) {
-                        const errorData = await sessionResponse.json().catch(() => ({ message: 'Unknown error' }));
-                        console.error('Last.fm getSession failed:', errorData);
-                        response = new Response(`Failed to get Last.fm session key: ${sessionResponse.status} - ${errorData.message || 'Unknown error'}`, { status: 500 });
-                    } else {
-                        const sessionData = await sessionResponse.json();
-                        const sessionKey = sessionData.session?.key;
-                        const lastFmUsername = sessionData.session?.name;
-
-                        if (!sessionKey || !lastFmUsername) {
-                            response = new Response('Failed to retrieve Last.fm session key or username from Last.fm API response.', { status: 500 });
-                        } else {
-                            // Retrieve existing user credentials to update only Last.fm part
-                            const existingCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
-                            let userCreds: UserCredentials = existingCredsStr ? JSON.parse(existingCredsStr) : {};
-                            userCreds.lastFm = {
-                                username: lastFmUsername,
-                                sessionKey: sessionKey
-                            };
-                            await SPOTIFY_TOKENS.put(userId, JSON.stringify(userCreds));
-                            console.log(`[${userId}] Last.fm credentials saved to KV for user: ${lastFmUsername}.`);
-
-                            response = new Response(`Successfully logged in to Last.fm as ${lastFmUsername}! You can now shuffle your songs: <a href="/shuffle">Shuffle Songs</a>`, {
-                                headers: { 'Content-Type': 'text/html' },
-                                status: 200
-                            });
-                        }
-                    }
                 }
             }
 
@@ -784,27 +692,20 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             if (!userId) {
                 response = new Response('User ID missing. Please start from the main page.', { status: 400 });
             } else {
-                // Retrieve all user credentials
+                // Retrieve Spotify user credentials
                 const userCredsStr: string | null = await SPOTIFY_TOKENS.get(userId);
                 console.log(`[${userId}] Retrieved userCredsStr from KV: ${userCredsStr ? 'present' : 'absent'}`);
 
                 if (!userCredsStr) {
-                    response = new Response('No user credentials found. Please log in to Spotify and Last.fm first.', { status: 401 });
+                    response = new Response('No user credentials found. Please log in to Spotify first.', { status: 401 });
                 } else {
                     const userCreds: UserCredentials = JSON.parse(userCredsStr);
                     console.log(`[${userId}] Parsed userCreds: ${JSON.stringify(userCreds)}`);
 
                     const spotifyAccessToken = userCreds.spotify?.access_token;
-                    const lastFmUsername = userCreds.lastFm?.username;
-                    const lastFmSessionKey = userCreds.lastFm?.sessionKey;
 
                     if (!spotifyAccessToken) {
                         response = new Response('Spotify not authenticated. Please visit <a href="/login">/login</a> first.', {
-                            headers: { 'Content-Type': 'text/html' },
-                            status: 401
-                        });
-                    } else if (!lastFmUsername || !lastFmSessionKey) {
-                        response = new Response('Last.fm not authenticated. Please visit <a href="/lastfm-login">/lastfm-login</a> first.', {
                             headers: { 'Content-Type': 'text/html' },
                             status: 401
                         });
@@ -830,10 +731,6 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
                             userId,
                             spotifyAccessToken,
                             spotifyUserId,
-                            LASTFM_API_KEY,
-                            LASTFM_SHARED_SECRET,
-                            lastFmUsername,
-                            lastFmSessionKey,
                             processId
                         ));
 
@@ -866,14 +763,13 @@ async function handleRequest(request: Request, event: FetchEvent): Promise<Respo
             response = new Response(`
                 <h1>Spotify Liked Songs Shuffler Worker (Multi-User)</h1>
                 <p>Welcome! This worker helps you shuffle your Spotify liked songs into a new playlist, prioritizing least played songs using Last.fm data.</p>
-                <p><strong>Important:</strong> You need to authenticate with both Spotify and Last.fm.</p>
+                <p><strong>Important:</strong> You only need to authenticate with Spotify. Last.fm data will be fetched from a global account.</p>
                 <ul>
                     <li><a href="/login">Login with Spotify</a>: Authorize this worker to access your Spotify account.</li>
-                    <li><a href="/lastfm-login">Login with Last.fm</a>: Authorize this worker to access your Last.fm account.</li>
-                    <li><a href="/shuffle">Shuffle Liked Songs (Async)</a>: After logging into both, visit this URL to initiate the playlist generation. You'll get a process ID to check its status.</li>
+                    <li><a href="/shuffle">Shuffle Liked Songs (Async)</a>: After logging into Spotify, visit this URL to initiate the playlist generation. You'll get a process ID to check its status.</li>
                     <li><strong>Check Status:</strong> After starting a shuffle, append the process ID to <code>/status/</code> (e.g., <code>/status/YOUR_PROCESS_ID</code>) to get updates.</li>
                 </ul>
-                <p>Make sure you have set up the required environment variables (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, <strong>LASTFM_API_KEY, LASTFM_SHARED_SECRET</strong>) and a KV namespace (SPOTIFY_TOKENS) in your Cloudflare Worker settings.</p>
+                <p>Make sure you have set up the required environment variables (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, <strong>LASTFM_API_KEY, LASTFM_SHARED_SECRET, LASTFM_USERNAME</strong>) and a KV namespace (SPOTIFY_TOKENS) in your Cloudflare Worker settings.</p>
             `, { headers: { 'Content-Type': 'text/html' } });
         }
 
