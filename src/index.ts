@@ -9,6 +9,11 @@
  *
  * ONLY SONGS THAT HAVE A PLAY COUNT RECORDED IN LAST.FM ARE INCLUDED.
  *
+ * API REQUESTS ARE NOW LIMITED ONLY WHEN ADDING TRACKS TO THE SPOTIFY PLAYLIST.
+ * This means fetching all liked songs and Last.fm top tracks will attempt to get
+ * the full available data, but the final playlist size will be capped by the
+ * request limit for adding tracks.
+ *
  * The /shuffle endpoint returns immediately, and the playlist creation
  * happens asynchronously. A new /status/:processId endpoint allows checking
  * the progress and results.
@@ -44,8 +49,16 @@ const LASTFM_API_BASE_URL: string = 'http://ws.audioscrobbler.com/2.0/';
 // KV key prefix for storing playlist generation status
 const STATUS_KEY_PREFIX: string = 'playlist_status_';
 
+// --- API Request Limits ---
+// These limits are designed to keep the total subrequests under 50.
+// Fetching liked songs and Last.fm top tracks will now attempt to get all data.
+// The primary limit is now on adding tracks to the playlist.
+const SPOTIFY_PLAYLIST_ADD_MAX_REQUESTS: number = 40;     // Max 40 Spotify API calls for adding tracks (40 * 100 = 4000 tracks)
+                                                         // This leaves ~10 requests for initial auth, fetching liked songs,
+                                                         // and fetching Last.fm top tracks.
+
 // Configuration for Last.fm API fetching (for top tracks, not individual lookups)
-const LASTFM_TOP_TRACKS_LIMIT: number = 1000; // Max limit per page for user.getTopTracks
+const LASTFM_TOP_TRACKS_LIMIT_PER_PAGE: number = 1000; // Max limit per page for user.getTopTracks
 const LASTFM_PAGE_DELAY_MS: number = 200; // Delay between fetching Last.fm top track pages
 
 // --- Type Definitions ---
@@ -204,7 +217,7 @@ async function getValidAccessToken(userId: string): Promise<string> {
 
 /**
  * Fetches all liked songs (tracks) for the authenticated user.
- * Handles pagination.
+ * Handles pagination until all songs are fetched or an error occurs.
  * @param {string} accessToken - The Spotify access token.
  * @returns {Promise<SpotifyTrack[]>} An array of track objects.
  */
@@ -223,6 +236,7 @@ async function fetchAllLikedSongs(accessToken: string): Promise<SpotifyTrack[]> 
 
 /**
  * Fetches a user's top tracks from Last.fm, handling pagination.
+ * Fetches all available pages up to Last.fm's internal limits.
  * @param {string} lastFmApiKey - Your Last.fm API key.
  * @param {string} lastFmUsername - Your Last.fm username.
  * @returns {Promise<Array<{ artist: string, name: string, playcount: number }>>} An array of top track objects.
@@ -237,7 +251,7 @@ async function fetchLastFmTopTracks(lastFmApiKey: string, lastFmUsername: string
             method: 'user.getTopTracks',
             user: lastFmUsername,
             api_key: lastFmApiKey,
-            limit: LASTFM_TOP_TRACKS_LIMIT,
+            limit: LASTFM_TOP_TRACKS_LIMIT_PER_PAGE,
             page: page,
             format: 'json'
         };
@@ -245,9 +259,9 @@ async function fetchLastFmTopTracks(lastFmApiKey: string, lastFmUsername: string
 
         try {
             const response: Response = await fetch(url);
+
             if (!response.ok) {
                 console.error(`Last.fm API Error (${response.status}) fetching top tracks for page ${page}`);
-                // If an error occurs, we might still have partial data, so break and return what we have.
                 break;
             }
             const data: any = await response.json();
@@ -361,21 +375,29 @@ async function createPlaylist(accessToken: string, userId: string, playlistName:
 }
 
 /**
- * Adds tracks to a playlist. Spotify API limits to 100 tracks per request.
+ * Adds tracks to a playlist, respecting a maximum number of API requests.
+ * Spotify API limits to 100 tracks per request.
  * @param {string} accessToken - The Spotify access token.
  * @param {string} playlistId - The ID of the playlist.
  * @param {string[]} trackUris - An array of Spotify track URIs (e.g., ['spotify:track:ID1', 'spotify:track:ID2']).
+ * @param {number} maxRequests - The maximum number of API requests to make for adding tracks.
  * @returns {Promise<void>}
  */
-async function addTracksToPlaylist(accessToken: string, playlistId: string, trackUris: string[]): Promise<void> {
+async function addTracksToPlaylist(accessToken: string, playlistId: string, trackUris: string[], maxRequests: number): Promise<void> {
     const batchSize: number = 100;
-    for (let i = 0; i < trackUris.length; i += batchSize) {
+    let requestCount = 0;
+
+    for (let i = 0; i < trackUris.length && requestCount < maxRequests; i += batchSize) {
         const batch: string[] = trackUris.slice(i, i + batchSize);
         await spotifyApiFetch(`${SPOTIFY_API_BASE_URL}/playlists/${playlistId}/tracks`, accessToken, {
             method: 'POST',
             body: JSON.stringify({ uris: batch }),
         });
-        console.log(`Added batch of ${batch.length} tracks to playlist ${playlistId}`);
+        requestCount++;
+        console.log(`Added batch of ${batch.length} tracks to playlist ${playlistId} (Request ${requestCount}/${maxRequests})`);
+    }
+    if (requestCount >= maxRequests && trackUris.length > requestCount * batchSize) {
+        console.warn(`Stopped adding tracks to playlist after ${maxRequests} requests due to limit.`);
     }
 }
 
@@ -393,11 +415,12 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
     try {
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'fetching_liked_songs',
-            message: 'Fetching liked songs from Spotify...',
+            message: `Fetching all liked songs from Spotify...`, // Removed max limit message
             timestamp: Date.now(),
             progress: '0%'
         } as PlaylistStatus));
 
+        // Fetch all liked songs (no request limit applied here)
         const likedTracks: SpotifyTrack[] = await fetchAllLikedSongs(accessToken);
         if (likedTracks.length === 0) {
             await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
@@ -411,11 +434,12 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'fetching_lastfm_top_tracks',
-            message: 'Fetching Last.fm top tracks (this may take a while for large libraries)...',
+            message: `Fetching all Last.fm top tracks (this may take a while for large libraries)...`, // Removed max limit message
             timestamp: Date.now(),
             progress: '10%'
         } as PlaylistStatus));
 
+        // Fetch all Last.fm top tracks (no request limit applied here)
         const lastFmTopTracks = await fetchLastFmTopTracks(LASTFM_API_KEY, LASTFM_USERNAME);
         const lastFmPlayCountMap = new Map<string, number>(); // Key: "ArtistName - TrackName" (normalized)
 
@@ -479,13 +503,14 @@ async function startPlaylistGeneration(userId: string, accessToken: string, spot
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'adding_tracks',
-            message: `Adding ${shuffledTracks.length} tracks to playlist...`,
+            message: `Adding ${shuffledTracks.length} tracks to playlist (limited to ${SPOTIFY_PLAYLIST_ADD_MAX_REQUESTS * 100} tracks)...`, // Updated message
             timestamp: Date.now(),
             progress: '98%'
         } as PlaylistStatus));
 
         const trackUris: string[] = shuffledTracks.map((track: TrackWithPlayCount) => track.uri);
-        await addTracksToPlaylist(accessToken, playlistId, trackUris);
+        // Apply limit only here
+        await addTracksToPlaylist(accessToken, playlistId, trackUris, SPOTIFY_PLAYLIST_ADD_MAX_REQUESTS);
 
         await SPOTIFY_TOKENS.put(statusKey, JSON.stringify({
             status: 'completed',
